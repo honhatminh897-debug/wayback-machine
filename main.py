@@ -4,6 +4,8 @@ import re
 import asyncio
 import logging
 import time
+import random
+from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -21,11 +23,43 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
 ALERT_AGE_YEARS = float(os.getenv("ALERT_AGE_YEARS", "5"))
 PROGRESS_THROTTLE_SEC = float(os.getenv("PROGRESS_THROTTLE_SEC", "2"))
+CDX_RPS = float(os.getenv("CDX_RPS", "2"))  # requests per second
+CDX_JITTER_MS = int(os.getenv("CDX_JITTER_MS", "250"))
 
 CDX_BASE = "https://web.archive.org/cdx/search/cdx?output=json&fl=timestamp,original&collapse=digest&sort=asc&from=1996"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("wayback-age-bot")
+
+# ========= Global rate limiter (simple token bucket via timestamp deque) =========
+class RateLimiter:
+    def __init__(self, rps: float):
+        self.rps = max(0.1, rps)
+        self.interval = 1.0 / self.rps
+        self._dq = deque()
+        self._lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self._lock:
+            now = time.monotonic()
+            # pop stale
+            while self._dq and now - self._dq[0] > 1.0:
+                self._dq.popleft()
+            if len(self._dq) >= int(self.rps):
+                # wait until earliest is older than 1 second
+                to_sleep = max(0.0, 1.0 - (now - self._dq[0]))
+                await asyncio.sleep(to_sleep)
+                # re-evaluate after sleep
+                now = time.monotonic()
+                while self._dq and now - self._dq[0] > 1.0:
+                    self._dq.popleft()
+            # record this request
+            self._dq.append(time.monotonic())
+            # add small jitter to avoid sync bursts
+            if CDX_JITTER_MS > 0:
+                await asyncio.sleep(random.uniform(0, CDX_JITTER_MS / 1000.0))
+
+rate_limiter = RateLimiter(CDX_RPS)
 
 # ========= Helpers =========
 def _normalize_domain(raw: str) -> str:
@@ -44,8 +78,27 @@ def _years_between(d1: datetime, d2: datetime) -> float:
     return (d2 - d1).days / 365.2425
 
 async def _http_get_json_or_text(session: aiohttp.ClientSession, url: str):
-    async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
-        if resp.status in (429, 502, 503, 504):
+    await rate_limiter.wait()  # ensure RPS
+    headers = {"Accept": "application/json, */*",
+               "User-Agent": "WaybackAgeBot/1.0 (+https://railway.app)"}
+    async with session.get(url, timeout=REQUEST_TIMEOUT, headers=headers) as resp:
+        if resp.status == 429:
+            retry_after = resp.headers.get("Retry-After")
+            sleep_s = 2.0
+            if retry_after:
+                try:
+                    sleep_s = max(sleep_s, float(retry_after))
+                except Exception:
+                    pass
+            # extra jitter
+            sleep_s += random.uniform(0, 1.5)
+            await asyncio.sleep(sleep_s)
+            # raise to trigger caller logic (will retry loop)
+            raise aiohttp.ClientResponseError(
+                request_info=resp.request_info, history=resp.history,
+                status=429, message=f"HTTP 429 after wait {sleep_s:.1f}s"
+            )
+        if resp.status in (502, 503, 504):
             raise aiohttp.ClientResponseError(
                 request_info=resp.request_info, history=resp.history,
                 status=resp.status, message=f"Transient HTTP {resp.status}"
@@ -77,12 +130,18 @@ def _parse_num_pages(payload) -> int | None:
             return int(m.group(1))
     return None
 
-async def _cdx_attempt(session: aiohttp.ClientSession, url: str):
-    try:
-        return await _http_get_json_or_text(session, url)
-    except Exception as e:
-        logger.warning("CDX request failed: %r", e)
-        return None
+async def _cdx_attempt(session: aiohttp.ClientSession, url: str, retries: int = 5):
+    backoff = 1.0
+    last_err = None
+    for _ in range(retries):
+        try:
+            return await _http_get_json_or_text(session, url)
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(backoff + random.uniform(0, 0.5))
+            backoff = min(backoff * 2, 16)
+    logger.warning("CDX request failed after retries: %r", last_err)
+    return None
 
 async def fetch_counts(session: aiohttp.ClientSession, domain: str) -> tuple[int | None, int | None]:
     base = "https://web.archive.org/cdx/search/cdx?showNumPages=true&pageSize=1"
@@ -103,32 +162,25 @@ async def fetch_earliest_snapshot(session: aiohttp.ClientSession, domain: str, s
         f"{CDX_BASE}&matchType=prefix&url={domain}/*&limit=1",
     ]
 
-    backoff = 1
-    for _ in range(4):
+    for url in attempts:
         async with semaphore:
-            for url in attempts:
-                payload = await _cdx_attempt(session, url)
-                if isinstance(payload, list) and len(payload) >= 2 and len(payload[1]) >= 1:
-                    ts = payload[1][0]
-                    if ts:
-                        try:
-                            dt = datetime.strptime(ts, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-                            result["earliest_snapshot"] = dt.astimezone(TIMEZONE).strftime("%Y-%m-%d")
-                            result["age_years"] = round(_years_between(dt, datetime.now(timezone.utc)), 2)
-                        except Exception as e:
-                            result["error"] = f"parse_ts: {repr(e)}"
-                        break
-        if result["earliest_snapshot"] is not None:
+            payload = await _cdx_attempt(session, url)
+        if isinstance(payload, list) and len(payload) >= 2 and len(payload[1]) >= 1:
+            ts = payload[1][0]
+            if ts:
+                try:
+                    dt = datetime.strptime(ts, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                    result["earliest_snapshot"] = dt.astimezone(TIMEZONE).strftime("%Y-%m-%d")
+                    result["age_years"] = round(_years_between(dt, datetime.now(timezone.utc)), 2)
+                except Exception as e:
+                    result["error"] = f"parse_ts: {repr(e)}"
             break
-        await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 20)
 
     try:
         total, ok = await fetch_counts(session, domain)
         result["snapshots_total"] = total
         result["snapshots_200"] = ok
     except Exception as e:
-        logger.warning("count error for %s: %r", domain, e)
         if result["error"]:
             result["error"] += f"; count: {repr(e)}"
         else:
@@ -177,7 +229,8 @@ async def process_file_with_logs(update: Update, context: ContextTypes.DEFAULT_T
     header_msg = (
         "🔍 *Bắt đầu kiểm tra Wayback* — SEO crawl mode on 🕷️\n"
         f"• Tổng domain: *{len(domains)}*\n"
-        "• Mẹo: Domain già (≥ 5 năm) thường có lợi thế trust 📈"
+        f"• RPS giới hạn: *{CDX_RPS}* — Concurrency: *{MAX_CONCURRENCY}*\n"
+        "• Mẹo: Domain già (≥ ngưỡng) thường có lợi thế trust 📈"
     )
     status = await context.bot.send_message(chat_id, header_msg, parse_mode=constants.ParseMode.MARKDOWN)
 
@@ -186,19 +239,31 @@ async def process_file_with_logs(update: Update, context: ContextTypes.DEFAULT_T
     started = time.time()
     last_edit = 0.0
     aged_hits = 0
+    cdx429 = 0
+
+    async def one(domain: str):
+        nonlocal cdx429
+        try:
+            return await fetch_earliest_snapshot(session, domain, semaphore)
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:
+                cdx429 += 1
+            return {"domain": domain, "earliest_snapshot": None, "age_years": None,
+                    "snapshots_total": None, "snapshots_200": None, "error": f"http_error:{e.status}"}
+        except Exception as e:
+            return {"domain": domain, "earliest_snapshot": None, "age_years": None,
+                    "snapshots_total": None, "snapshots_200": None, "error": f"exc:{repr(e)}"}
 
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(domains), BATCH_SIZE):
             batch = domains[i:i+BATCH_SIZE]
-            batch_tasks = [fetch_earliest_snapshot(session, d, semaphore) for d in batch]
-            batch_results = await asyncio.gather(*batch_tasks)
+            batch_results = await asyncio.gather(*[one(d) for d in batch])
             results.extend(batch_results)
 
-            # Alert sớm cho các domain già
+            # Alerts
             for r in batch_results:
                 age = r.get("age_years")
                 if age is not None and age >= ALERT_AGE_YEARS:
-                    aged_hits += 1
                     em = "🧲" if age >= 10 else "⭐"
                     caption = (
                         f"{em} *SEO Alert*: `{r['domain']}` *{age} năm* — từ {r.get('earliest_snapshot')}\n"
@@ -206,10 +271,10 @@ async def process_file_with_logs(update: Update, context: ContextTypes.DEFAULT_T
                     )
                     try:
                         await context.bot.send_message(chat_id, caption, parse_mode=constants.ParseMode.MARKDOWN)
-                    except Exception as e:
-                        logger.warning("send alert fail: %r", e)
+                    except Exception:
+                        pass
 
-            # Cập nhật progress (throttle)
+            # Progress
             now = time.time()
             if now - last_edit >= PROGRESS_THROTTLE_SEC:
                 done = len(results)
@@ -218,8 +283,8 @@ async def process_file_with_logs(update: Update, context: ContextTypes.DEFAULT_T
                 ok_count = sum(1 for r in results if r.get("earliest_snapshot"))
                 msg = (
                     f"🐼 *Đang crawl Wayback* {bar} {done}/{len(domains)}\n"
-                    f"• Có dữ liệu: *{ok_count}* — Alert ≥{ALERT_AGE_YEARS}y: *{aged_hits}*\n"
-                    f"• Batch vừa xong: {len(batch)} — Concurrency: {MAX_CONCURRENCY}\n"
+                    f"• Có dữ liệu: *{ok_count}* — Alert ≥{ALERT_AGE_YEARS}y: *{sum(1 for r in results if (r.get('age_years') or 0) >= ALERT_AGE_YEARS)}*\n"
+                    f"• Batch xong: {len(batch)} — 429 gần đây: {cdx429}\n"
                     f"• Đã chạy: {elapsed}s\n"
                     "🐧 Mẹo SEO: Ưu tiên domain có nhiều snapshot 200 📈"
                 )
@@ -227,15 +292,14 @@ async def process_file_with_logs(update: Update, context: ContextTypes.DEFAULT_T
                     await context.bot.edit_message_text(chat_id=chat_id, message_id=status.message_id,
                                                         text=msg, parse_mode=constants.ParseMode.MARKDOWN)
                     last_edit = now
-                except Exception as e:
-                    # Nếu edit fail (ví dụ nội dung giống nhau), gửi tin mới
+                except Exception:
                     try:
                         status = await context.bot.send_message(chat_id, msg, parse_mode=constants.ParseMode.MARKDOWN)
                         last_edit = now
-                    except Exception as e2:
-                        logger.warning("progress update fail: %r / %r", e, e2)
+                    except Exception:
+                        pass
 
-    # Kết thúc -> xuất Excel
+    # Output file
     cols = ["domain", "earliest_snapshot", "age_years", "snapshots_total", "snapshots_200", "error"]
     result_df = pd.DataFrame(results)[cols]
     result_df.sort_values(by=["age_years"], ascending=[False], inplace=True, na_position="last")
@@ -249,7 +313,9 @@ async def process_file_with_logs(update: Update, context: ContextTypes.DEFAULT_T
             "no_snapshot": [result_df['earliest_snapshot'].isna().sum()],
             "avg_snapshots_total": [result_df['snapshots_total'].dropna().mean() if result_df['snapshots_total'].notna().any() else None],
             "avg_snapshots_200": [result_df['snapshots_200'].dropna().mean() if result_df['snapshots_200'].notna().any() else None],
-            "generated_at": [datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")]
+            "generated_at": [datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S %Z")],
+            "cdx429_count": [cdx429],
+            "settings": [f"RPS={CDX_RPS}, CONC={MAX_CONCURRENCY}, BATCH={BATCH_SIZE}"]
         })
         summary.to_excel(writer, index=False, sheet_name="summary")
     buf.seek(0)
@@ -262,9 +328,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Gửi file Excel/CSV gồm *một cột* domain. Bot sẽ:\n"
         "• Tìm *snapshot sớm nhất* → tính *tuổi*\n"
         "• Đếm *snapshots tổng* & *200 OK*\n"
-        "• Hiển thị *log tiến trình* với icon SEO 🔍🐼🐧🕷️📈\n"
-        "• *Alert sớm* nếu domain ≥ 5 năm 🧲\n\n"
-        "Hỗ trợ: .xlsx, .xls, .csv, .txt"
+        "• Log tiến trình + chống 429 (rate limit toàn cục)\n"
+        "• *Alert sớm* nếu domain ≥ ngưỡng tuổi 🧲\n\n"
+        "Biến môi trường gợi ý: CDX_RPS=2, MAX_CONCURRENCY=10"
     )
     await update.message.reply_text(text, parse_mode=constants.ParseMode.MARKDOWN)
 
@@ -273,7 +339,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "❓ Cách dùng:\n"
         "• Một cột domain/URL\n"
         "• Gửi file (≤20MB)\n"
-        "• Bot sẽ log tiến trình + cảnh báo domain già, và trả Excel tổng hợp.",
+        "• Đặt CDX_RPS để giảm 429 nếu danh sách lớn.",
         parse_mode=constants.ParseMode.MARKDOWN
     )
 
